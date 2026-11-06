@@ -15,8 +15,8 @@ Solo play is unaffected (seller always == chopper). The split fraction is config
 
 | Zip | Contents |
 |-----|----------|
-| `dist/LogShare-v0.1.0.zip` | **Just LogShare** — drop into `ChoppingTrees\Binaries\Win64` (requires UE4SS already installed). |
-| `dist/ChoppingTrees-Mods-UE4SS-LumberVision-LogShare-v1.2.0.zip` | **Full drop-in** — UE4SS loader + Lumber Vision + LogShare, everything needed in one extract. |
+| `dist/LogShare-v0.1.1.zip` | **Just LogShare** — drop into `ChoppingTrees\Binaries\Win64` (requires UE4SS already installed). |
+| `dist/ChoppingTrees-Mods-UE4SS-LumberVision-LogShare-v1.2.1.zip` | **Full drop-in** — UE4SS loader + Lumber Vision + LogShare, everything needed in one extract. |
 
 Also mirrored as GitHub Release assets when published.
 
@@ -29,21 +29,25 @@ Also mirrored as GitHub Release assets when published.
 
 ## Install (LogShare only)
 
-Same as above but extract `LogShare-v0.1.0.zip`; UE4SS must already be present.
+Same as above but extract `LogShare-v0.1.1.zip`; UE4SS must already be present.
 
 ## Configuration
 
 - `ue4ss\Mods\LogShare\Scripts\LogShareConfig.lua`
   - `ChopperShare` — fraction paid to the original chopper when someone else sells (default `0.5`).
-  - `VerboseLogging` — log chops/sales/splits to the UE4SS console.
+  - `VerboseLogging` — log chops/sales/splits to the UE4SS console and file log.
   - `WriteGameOwnerProperties` — also write `LogOwnerId` / `ChopInstigator` when the game exposes them.
-  - `ShowSplitNotifications` — notify on splits.
+  - `ShowSplitNotifications` — on-screen toast when a split happens.
+  - `DebugScreen` — persistent on-screen status (player, money, tag count, last event).
+  - `DebugScreenRefreshMilliseconds` — status refresh (default `500`).
+  - `LogFile` — optional absolute path; empty tries `LogShare.log` then `Saved\Logs\LogShare.log`.
 - Restart the game after editing.
 
 ## Multiplayer notes
 
 - Run the mod on **both** co-op clients so ownership tags and Money adjustments stay consistent.
-- v0.1.0 tags logs via `BP_Tree_Log*` spawn watchers + world scan, and detects sales via `Money` attribute polling. Splits adjust each visible `PlayerState`'s `Money` on that client.
+- v0.1.1 tags logs via `BP_Tree_Log*` spawn watchers + world scan, and detects sales via `Money` attribute polling. Splits adjust each visible `PlayerState`'s `Money` on that client.
+- **Proton/Linux:** UE4SS's `dwmapi.dll` proxy is shadowed by Wine's builtin unless you set Steam launch options: `WINEDLLOVERRIDES=dwmapi=n,b %command%` (no quotes around the value).
 - If the other player's `PlayerState` is not visible, the split is logged but not delivered on that client.
 - Per-log sawmill hooks are planned once a live UE4SS class dump hardens the sale path.
 

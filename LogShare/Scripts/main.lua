@@ -19,6 +19,9 @@ local DEFAULT_CONFIG = {
     VerboseLogging = true,
     WriteGameOwnerProperties = true,
     ShowSplitNotifications = true,
+    DebugScreen = true,
+    DebugScreenRefreshMilliseconds = 500,
+    LogFile = "",
 }
 
 local config_ok, loaded_config = pcall(require, "LogShareConfig")
@@ -29,22 +32,127 @@ CHOPPER_SHARE = math.max(0.0, math.min(1.0, CHOPPER_SHARE))
 local VERBOSE = CONFIG.VerboseLogging ~= false
 local WRITE_OWNER_PROPS = CONFIG.WriteGameOwnerProperties ~= false
 local SHOW_TOAST = CONFIG.ShowSplitNotifications ~= false
+local DEBUG_SCREEN = CONFIG.DebugScreen ~= false
+local DEBUG_REFRESH_MS = tonumber(CONFIG.DebugScreenRefreshMilliseconds)
+    or DEFAULT_CONFIG.DebugScreenRefreshMilliseconds
+DEBUG_REFRESH_MS = math.max(200, math.min(5000, DEBUG_REFRESH_MS))
 
-local MOD_VERSION = "0.1.0"
+local MOD_VERSION = "0.1.1"
 
 -- ---------------------------------------------------------------------------
--- utilities
+-- utilities: console + file log + on-screen PrintString
 -- ---------------------------------------------------------------------------
+
+local log_handle = nil
+local log_path_used = nil
+local last_event = "boot"
+local last_event_at = os.clock()
+
+local function try_open_log(path)
+    if not path or path == "" then
+        return nil
+    end
+    local ok, handle = pcall(io.open, path, "a")
+    if ok and handle then
+        return handle, path
+    end
+    return nil
+end
+
+local function init_file_log()
+    local candidates = {}
+    if CONFIG.LogFile and CONFIG.LogFile ~= "" then
+        candidates[#candidates + 1] = CONFIG.LogFile
+    end
+    -- Relative to CWD (usually Win64 under Proton).
+    candidates[#candidates + 1] = "LogShare.log"
+    candidates[#candidates + 1] = "ue4ss\\Mods\\LogShare\\LogShare.log"
+    -- Wine/Proton default user AppData for this title.
+    candidates[#candidates + 1] =
+        "C:\\users\\steamuser\\AppData\\Local\\ChoppingTrees\\Saved\\Logs\\LogShare.log"
+    candidates[#candidates + 1] =
+        "C:/users/steamuser/AppData/Local/ChoppingTrees/Saved/Logs/LogShare.log"
+
+    for _, path in ipairs(candidates) do
+        local handle, opened = try_open_log(path)
+        if handle then
+            log_handle = handle
+            log_path_used = opened
+            handle:write(string.format(
+                "\n=== LogShare v%s session %s ===\n",
+                MOD_VERSION, os.date("!%Y-%m-%d %H:%M:%S UTC")
+            ))
+            handle:flush()
+            return
+        end
+    end
+end
 
 local function log(fmt, ...)
     local msg = string.format(fmt, ...)
-    print(string.format("%s %s\n", MOD_TAG, msg))
+    local line = string.format("%s %s", MOD_TAG, msg)
+    -- UE4SS console / stdout (shows in GuiConsole when enabled).
+    print(string.format("%s\n", line))
+    if log_handle then
+        pcall(function()
+            log_handle:write(string.format("[%s] %s\n", os.date("!%H:%M:%S"), msg))
+            log_handle:flush()
+        end)
+    end
 end
 
 local function vlog(fmt, ...)
     if VERBOSE then
         log(fmt, ...)
     end
+end
+
+local function note_event(text)
+    last_event = tostring(text)
+    last_event_at = os.clock()
+    vlog("event: %s", last_event)
+end
+
+local function show_on_screen(message, kind, duration)
+    local world_context = nil
+    pcall(function()
+        local candidates = FindAllOf("BP_Human_C")
+        if candidates then
+            for _, candidate in ipairs(candidates) do
+                if candidate and candidate:IsValid() then
+                    world_context = candidate
+                    break
+                end
+            end
+        end
+    end)
+    if not world_context then
+        pcall(function()
+            world_context = UEHelpers.GetPlayerController()
+        end)
+    end
+    if not world_context then
+        return
+    end
+    pcall(function()
+        local color = { 0.20, 0.85, 1.00, 1.00 }
+        if kind == "warn" then
+            color = { 1.00, 0.62, 0.15, 1.00 }
+        elseif kind == "ok" then
+            color = { 0.30, 1.00, 0.35, 1.00 }
+        elseif kind == "error" then
+            color = { 1.00, 0.30, 0.30, 1.00 }
+        end
+        UEHelpers.GetKismetSystemLibrary():PrintString(
+            world_context,
+            message,
+            true,
+            false,
+            color,
+            duration or 4.0,
+            FName("LogShare")
+        )
+    end)
 end
 
 local function is_valid(object)
@@ -245,6 +353,7 @@ local last_known_money = nil
 local last_local_player = nil
 local pending_split_toast = nil
 local toast_until = 0.0
+local toast_echoed = false
 
 local function is_log_actor(actor)
     local name = class_name(actor)
@@ -287,6 +396,7 @@ local function tag_log(actor, owner_id, owner_name)
             end)
         end
     end
+    note_event(string.format("tagged log -> %s", tostring(owner_name)))
     vlog("tagged log %s -> %s (%s)", object_name(actor), tostring(owner_name), tostring(owner_id))
     return true
 end
@@ -444,6 +554,9 @@ local function apply_split(seller_id, seller_name, gain, foreign_choppers)
             table.concat(parts, ", ")
         )
         toast_until = os.clock() + 6.0
+        toast_echoed = false
+        note_event(pending_split_toast)
+        show_on_screen(pending_split_toast, "ok", 6.0)
     end
 end
 
@@ -517,10 +630,57 @@ local function maybe_show_toast()
         pending_split_toast = nil
         return
     end
-    -- Log as fallback UI; a widget hook can be added once HUD paths are dumped.
-    if VERBOSE then
+    -- Already shown via PrintString; keep a console echo once per toast.
+    if VERBOSE and not toast_echoed then
         log("NOTIFY %s", pending_split_toast)
+        toast_echoed = true
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- debug screen: persistent on-screen status (money / tags / last event)
+-- ---------------------------------------------------------------------------
+
+local debug_shown = false
+
+local function count_ownership()
+    local n = 0
+    for _ in pairs(ownership) do
+        n = n + 1
+    end
+    return n
+end
+
+local function debug_status_line()
+    local human = find_player()
+    local money_s = "?"
+    local player_s = "?"
+    if human then
+        local id, name = player_id_of(human)
+        player_s = tostring(name or id or "?")
+        local ps = safe_get(human, "PlayerState")
+        local money = get_money(ps)
+        if money ~= nil then
+            money_s = tostring(math.floor(money))
+        end
+    end
+    local tags = count_ownership()
+    local age = math.floor(os.clock() - last_event_at)
+    return string.format(
+        "LogShare v%s | %s | $%s | tags=%d | last %ds: %s",
+        MOD_VERSION, player_s, money_s, tags, age, last_event
+    )
+end
+
+local function tick_debug_screen()
+    if not DEBUG_SCREEN then
+        return
+    end
+    local line = debug_status_line()
+    -- Refresh duration slightly longer than the refresh interval so the line
+    -- does not flicker between ticks.
+    show_on_screen(line, "info", (DEBUG_REFRESH_MS / 1000.0) + 0.25)
+    debug_shown = true
 end
 
 -- ---------------------------------------------------------------------------
@@ -601,6 +761,7 @@ end
 local poll_handle = nil
 local scan_handle = nil
 local toast_handle = nil
+local debug_handle = nil
 
 local function stop_timers()
     if poll_handle then
@@ -615,33 +776,33 @@ local function stop_timers()
         pcall(function() toast_handle:Kill() end)
         toast_handle = nil
     end
+    if debug_handle then
+        pcall(function() debug_handle:Kill() end)
+        debug_handle = nil
+    end
 end
 
 local function start_timers()
     stop_timers()
     -- Poll money ~4x per second.
-    poll_handle = ExecuteInGameThreadWithDelay(250, function tick()
+    local function tick()
         poll_money()
         maybe_show_toast()
         poll_handle = ExecuteInGameThreadWithDelay(250, tick)
-    end)
+    end
+    poll_handle = ExecuteInGameThreadWithDelay(250, tick)
     -- Re-scan world logs periodically for late tags (other client's logs etc.).
     local scan_count = 0
-    scan_handle = ExecuteInGameThreadWithDelay(2000, function rescan()
+    local function rescan()
         scan_count = scan_count + 1
         local n = scan_existing_logs()
         if n > 0 then
             vlog("scan tagged %d new log(s)", n)
+            note_event(string.format("scan tagged %d", n))
         end
-        -- Every ~15s also drop ownership of destroyed logs (address reuse guard
-        -- is cheap: we just clear entries whose actor is gone).
+        -- Every ~15s drop ownership of very old tags (sold/despawned logs).
         if scan_count % 7 == 0 then
             local dead = {}
-            for addr, _ in pairs(ownership) do
-                -- Can't IsValid an address alone; entries are refreshed on touch.
-                -- Prune very old tags (logs despawn when sold).
-                -- (Handled by age check below.)
-            end
             local now = os.clock()
             for addr, info in pairs(ownership) do
                 if now - (info.tagged_at or 0) > 600 then
@@ -653,29 +814,55 @@ local function start_timers()
             end
         end
         scan_handle = ExecuteInGameThreadWithDelay(2000, rescan)
-    end)
-    toast_handle = ExecuteInGameThreadWithDelay(500, function toast_tick()
+    end
+    scan_handle = ExecuteInGameThreadWithDelay(2000, rescan)
+    local function toast_tick()
         maybe_show_toast()
         toast_handle = ExecuteInGameThreadWithDelay(500, toast_tick)
-    end)
+    end
+    toast_handle = ExecuteInGameThreadWithDelay(500, toast_tick)
+    if DEBUG_SCREEN then
+        local function debug_tick()
+            local ok, err = pcall(tick_debug_screen)
+            if not ok then
+                vlog("debug screen error: %s", tostring(err))
+            end
+            debug_handle = ExecuteInGameThreadWithDelay(DEBUG_REFRESH_MS, debug_tick)
+        end
+        debug_handle = ExecuteInGameThreadWithDelay(DEBUG_REFRESH_MS, debug_tick)
+    end
 end
 
 local function bootstrap()
-    log("v%s loading (chopper share %.0f%%)", MOD_VERSION, CHOPPER_SHARE * 100)
+    log("v%s loading (chopper share %.0f%%, debug=%s, file_log=%s)",
+        MOD_VERSION, CHOPPER_SHARE * 100,
+        tostring(DEBUG_SCREEN), tostring(log_path_used or "none"))
     local hooks = register_chop_hooks()
     local watchers = register_log_spawners()
     local tagged = scan_existing_logs()
     log("ready: %d spawn watcher(s), %d native hook(s), %d existing log(s) tagged",
         watchers, hooks, tagged)
+    note_event(string.format("ready watchers=%d hooks=%d tags=%d", watchers, hooks, tagged))
     start_timers()
+    show_on_screen(
+        string.format("LogShare v%s ready (share %.0f%%)", MOD_VERSION, CHOPPER_SHARE * 100),
+        "ok", 5.0
+    )
 end
+
+-- File log as early as the script loads (so even bootstrap failures are captured).
+init_file_log()
 
 -- Wait until the world exists before scanning.
 ExecuteInGameThreadWithDelay(1500, function()
     local ok, err = pcall(bootstrap)
     if not ok then
         log("bootstrap failed: %s", tostring(err))
+        show_on_screen("LogShare bootstrap FAILED (see log)", "error", 8.0)
     end
 end)
 
-log("loaded; deferring bootstrap 1.5s")
+log("loaded; file=%s; deferring bootstrap 1.5s", tostring(log_path_used or "not-open-yet"))
+if DEBUG_SCREEN then
+    show_on_screen("LogShare loading...", "info", 3.0)
+end
