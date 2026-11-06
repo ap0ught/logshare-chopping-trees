@@ -1,0 +1,3 @@
+# Derived/staging only; ship via releases, not git history noise if preferred
+*.tmp
+.DS_Store
